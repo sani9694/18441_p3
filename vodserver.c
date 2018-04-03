@@ -3,6 +3,7 @@
  * usage: echoserver <port>
  */
 
+
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -15,11 +16,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
-#include <time.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <time.h>
 #include <stdarg.h>
+#include <sys/time.h>
+#include <time.h>
 
 
 #define BUFSIZE 1024
@@ -137,7 +138,6 @@ typedef struct {
     uint16_t ack;           //bytes 10 - 11
     uint16_t window;        //bytes 12 - 13
     uint16_t rtt;           //bytes 14 - 15
-    // uint16_t error;         //bytes 16 - 17
     char* data;             //bytes 16 - (17+length)
 } packet;
 
@@ -204,9 +204,7 @@ void re_tx_last_sender(packet* p, New_flow* nf, int fd);
 
 int getTimeMilliseconds() {
     struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &t);
-
-    uint64_t delta_ms = (t.tv_sec * 1000 + t.tv_nsec / 1000000);
+    uint64_t delta_ms = mach_absolute_time();
     return delta_ms;
 }
 
