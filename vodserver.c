@@ -1441,7 +1441,6 @@ int main(int argc, char **argv) {
         printPeer(peer_table[i]);
     }
 
-    remove_peer(peer_table[1]->uuid);
     srand(time(NULL)); //Initialize random number generator
 
     /* socket: create a socket */
