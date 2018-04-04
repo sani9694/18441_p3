@@ -1321,6 +1321,21 @@ void config(char* conf_file)
         //Generate UUID
         printf("Need to generate UUID\n");
         uuid_generate(self->uuid);
+        //Save to config file
+        fclose(file);
+        file = fopen(conf_file, "a");
+
+        if(file == NULL)
+        {
+            printf("Config File: %s could not be found!\n", conf_file);
+        }
+
+        bzero(key, MAXLINE);
+        bzero(val, MAXLINE);
+        uuid_unparse(self->uuid, val);
+        sprintf(key, "\nuuid = %s", val);
+        fwrite(key, strlen(key), 1, file);
+        fclose(file);
     }
     if(self->content_dir == NULL)
     {
