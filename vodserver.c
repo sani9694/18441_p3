@@ -21,6 +21,7 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
+#include <uuid/uuid.h>
 
 
 #define BUFSIZE 1024
@@ -78,7 +79,11 @@ typedef enum {
     ADD = 1,
     CONFIG = 2,
     STATUS = 3,
-    NONE = 4
+    NONE = 4,
+    KILL = 5,
+    UUID = 6,
+    ADDNEIGHBOR = 7,
+    NEIGHBORS = 8
 } peer_method;
 
 /* Client Info for Connection Thread*/
@@ -98,8 +103,11 @@ typedef struct {
     char temp[MAXLINE];
     char ext[MAXLINE];
     char host[MAXLINE];
+    uuid_t uuid;
     unsigned int back_port;
+    unsigned int front_port;
     unsigned int rate;
+    unsigned int distance;
     parse_result result;
     peer_method pm;
 } url_info;
@@ -124,6 +132,7 @@ ftype file_types [] = {
     {".mp4", "video/mp4"},
     {".webm", "video/webm"},
     {".octet-stream","application/octet-stream"},
+    {".json", "application/json"},
     {NULL, NULL},
 };
 int rand_close = 0;
@@ -140,6 +149,39 @@ typedef struct {
     uint16_t rtt;           //bytes 14 - 15
     char* data;             //bytes 16 - (17+length)
 } packet;
+
+typedef struct peer{
+    uuid_t uuid;
+    char* name;
+    uint16_t front_port;
+    uint16_t back_port;
+    char* content_dir;
+    int distance;
+    int num_files;
+    char* files[20];       //Max number of files one peer can have is 20 **** MAYBE REVISIT AND MAKE IT DYNAMICALLY ALLOCATE
+    char* host;
+    struct sockaddr_in addr;
+} peer, *peer_t;
+
+void printPeer(peer_t self)
+{
+    char* ud = malloc(sizeof(char)*37);
+    printf("------------------------Peer: %s---------------------\n", self->name);
+    uuid_unparse(self->uuid, ud);
+    printf("uuid: %s\n", ud);
+    printf("name: %s\n", self->name);
+    printf("frontend_port: %u\n", self->front_port);
+    printf("backend_port: %u\n", self->back_port);
+    printf("content_dir: %s\n", self->content_dir);
+    printf("-----------------------------------------------------------\n");
+}
+
+
+peer_t peer_table[100];
+static int num_peers = 0;
+
+
+
 
 typedef struct{
     char *filename;
@@ -250,6 +292,56 @@ uint16_t getSequence()
     return (uint16_t)(rand());
 }
 
+void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, int distance)
+{
+    peer_t np = malloc(sizeof(peer));
+    uuid_copy(np->uuid, uuid);
+
+    np->host = malloc(sizeof(char)*strlen(host));
+    sprintf(np->host, "%s", host);
+
+    np->name = malloc(sizeof(char)*8);
+    sprintf(np->name, "peer_%d", (num_peers-1));
+
+    np->back_port = backend;
+    np->front_port = frontend;
+    np->distance = distance;
+    np->content_dir = malloc(sizeof(char)*9);
+    np->content_dir = "content/";
+    np->num_files = 0;
+    peer_table[num_peers] = np;
+    num_peers++;
+}
+
+char* peerToJSON(peer_t p)
+{
+    char* json = malloc(sizeof(char)*400);
+    char uuid[40];
+    uuid_unparse(p->uuid, uuid);
+    sprintf(json, "{\"uuid\":\"%s\","
+                  "\"name\":\"%s\","
+                  "\"host\":\"%s\","
+                  "\"frontend\":\"%u\","
+                  "\"backend\":\"%u\","
+                  "\"metric\":\"%d\"}", uuid, p->name, p->host, p->front_port, p->back_port, p->distance);
+    return json;
+
+}
+
+char* tableToJSON()
+{
+    char* json = malloc(sizeof(char)*MAXLINE);
+    sprintf(json, "[%s", peerToJSON(peer_table[0]));
+    for(int i = 1; i < num_peers; i++)
+    {
+        json = strcat(json, ",");
+        json = strcat(json, peerToJSON(peer_table[i]));
+    }
+    json = strcat(json, "]");
+    return json;
+}
+
+
 /* Addpeer: adds the peer address and port to the table */
 
 void addPeer(char *file, struct sockaddr_in serveraddr, unsigned short int s_port){
@@ -274,6 +366,43 @@ void addPeer(char *file, struct sockaddr_in serveraddr, unsigned short int s_por
     db_entries++;
     // printf("added!\n");
     return;
+}
+
+void addFile(char* file, uuid_t uuid)
+{
+    peer_t p;
+    for(int i = 0; i < num_peers; i++)
+    {
+        if(uuid_compare(uuid, peer_table[i]->uuid) == 0)
+        {
+            p = peer_table[i];
+            printf("Adding file: %s to peer: %s\n", file, p->name);
+            p->files[p->num_files] = malloc(sizeof(char)*strlen(file));
+            sprintf(p->files[p->num_files], "%s", file);
+            p->num_files++;
+            return;
+        }
+    }
+    printf("No peer with that UUID was found so the file could not be added!\n");
+}
+
+//Takes a file name and returns the index of the peer with it in the peer_table
+//returns -1 if not found
+int fileLook(char* file)
+{
+    peer_t p;
+    for(int i = 0; i < num_peers; i++)
+    {
+        p = peer_table[i];
+        for(int j = 0; j < p->num_files; j++)
+        {
+            if(strcmp(file, p->files[j]) == 0)
+            {
+                return i;
+            }
+        }
+    }
+    return -1;
 }
 
 void sendHeaders(char* file_size, char* filename, int clientfd){
@@ -390,23 +519,19 @@ void getContent(char* path, int fd)
     unsigned short port;
     char* buf;
     packet* req;
+    int index;
 
     //Look for who has the file in the lookup table
-    for(int i = 0; i < db_entries; i++)
-    {
-        // printf("Checking #%d %s\n", i, my_db[i].filename);
-        if(strcmp(my_db[i].filename, path) == 0)
-        {
-            // printf("Found the file!\n");
-            provider = &(my_db[i].addr);
-            port = my_db[i].port;
-        }
-    }
-    if(provider == NULL)
+    index = fileLook(path);
+
+    if(index == -1)
     {
         printf("This file has not been added yet\n\n");
         return;
     }
+
+    provider = &(peer_table[index]->addr);
+    port = peer_table[index]->back_port;
 
     //create a new request packet
     req = request_new_packet(path, getFlowID(), back_port, port);
@@ -597,8 +722,22 @@ url_info parse(char *buf){
     }
     else
     {
-        // printf("\nPEER: %s\n METHOD: %s\n PARAMS: %s\n", peer, pm, params);
-        if(pm[0] == 'v')
+        printf("\nPEER: %s\n METHOD: %s\n PARAMS: %s\n", peer, pm, params);
+        if(strcmp(pm, "kill") == 0)
+        {
+            parse_url.pm = KILL;
+        }
+        else if(strcmp(pm, "uuid") == 0)
+        {
+            printf("seeing a UUID request\n");
+            parse_url.pm = UUID;
+        }
+        else if(strcmp(pm, "neighbors") == 0)
+        {
+            printf("seeing a NEIGHBORS request\n");
+            parse_url.pm = NEIGHBORS;
+        }
+        else if(pm[0] == 'v')
         {
             //No parameters means this is a view or status request
             sscanf(pm, "%[^/]/%s", temp, path);
@@ -632,6 +771,10 @@ url_info parse(char *buf){
                 //CONFIG action
                 parse_url.pm = CONFIG;
             }
+            else if(strcmp(pm, "addneighbor") == 0)
+            {
+                parse_url.pm = ADDNEIGHBOR;
+            }
             
             //Parse the parameters
             token = strtok(params, "&");
@@ -652,13 +795,25 @@ url_info parse(char *buf){
                 {
                     snprintf(parse_url.host , sizeof(val), "%s", val);
                 }
-                if(strcmp(key, "port") == 0)
+                if(strcmp(key, "backend") == 0)
                 {
                     parse_url.back_port = (unsigned int)atoi(val);
+                }
+                if(strcmp(key, "frontend") == 0)
+                {
+                    parse_url.front_port = (unsigned int)atoi(val);
                 }
                 if(strcmp(key, "rate") == 0)
                 {
                     parse_url.rate = (unsigned int)atoi(val);
+                }
+                if(strcmp(key, "peer") == 0 || strcmp(key, "uuid") == 0)
+                {
+                    uuid_parse(val, parse_url.uuid);
+                }
+                if(strcmp(key, "metric") == 0)
+                {
+                    parse_url.distance = atoi(val);
                 }
                 token = strtok(NULL, "&");
             }
@@ -667,8 +822,8 @@ url_info parse(char *buf){
         
     }
 
-     parse_url.version = version;
-     parse_url.result = PARSE_CORRECT;
+    parse_url.version = version;
+    parse_url.result = PARSE_CORRECT;
     return parse_url;
 }
 
@@ -1089,7 +1244,102 @@ void re_tx_last_sender(packet* p, New_flow* nf, int on_fd){
 
 
 
+void config(char* conf_file)
+{
+    int peer_count = 1; //1 because 0th peer is always self
+    peer_t self = malloc(sizeof(peer));
+    FILE* file;
+    char* line;
+    char key[MAXLINE];
+    char val[MAXLINE];
+    size_t len = 0;
 
+    //set defaults
+    self->content_dir = NULL;
+    bzero(self->uuid, 16);
+
+    file = fopen(conf_file, "r");
+    if(file == NULL)
+    {
+        printf("Config File: %s could not be found!\n", conf_file);
+        exit(1);
+    }
+    while (getline(&line, &len, file) != -1) {
+        //printf("line: %s", line);
+        sscanf(line, "%[^ ] = %[^\n]", key, val);
+        //printf("key: \"%s\"\nval: \"%s\"\n\n", key, val);
+        if(strcmp(key, "uuid") == 0)
+        {
+            if(uuid_parse(val, self->uuid) == -1)
+            {
+                printf("Problem parsing uuid string given\n");
+            }
+        }
+        if(strcmp(key, "name") == 0)
+        {
+            sprintf(self->name, "%s", val);
+        }
+        if(strcmp(key, "frontend_port") == 0)
+        {
+            self->front_port = (unsigned int)atoi(val);
+        }
+        if(strcmp(key, "backend_port") == 0)
+        {
+            self->back_port = (unsigned int)atoi(val);
+        }
+        if(strcmp(key, "content_dir") == 0)
+        {
+            self->content_dir = malloc(sizeof(char)*strlen(val));
+            sprintf(self->content_dir, "%s", val);
+        }
+        if(strcmp(key, "peer_count") != 0 && strstr(key, "peer_") != NULL)
+        {
+            peer_t np = malloc(sizeof(peer));
+            char uuid_str[MAXLINE];
+            char host[MAXLINE];
+            sscanf(val, "%[^,],%[^,],%u,%u,%d", uuid_str, host, &(np->front_port), &(np->back_port), &(np->distance));
+            if(uuid_parse(uuid_str, np->uuid) == -1)
+            {
+                printf("Problem parsing peer's uuid string given\n");
+            }
+            np->name = malloc(sizeof(char)*strlen(key));
+            sprintf(np->name, "%s", key);
+
+            np->host = malloc(sizeof(char)*strlen(host));
+            sprintf(np->host, "%s", host);
+
+            np->content_dir = malloc(sizeof(char)*9);
+            np->content_dir = "content/";
+            np->num_files = 0;
+            //printPeer(np);
+            peer_table[peer_count] = np;
+            peer_count++;
+        }
+    }
+    if(uuid_is_null(self->uuid))
+    {
+        //Generate UUID
+        printf("Need to generate UUID\n");
+        uuid_generate(self->uuid);
+    }
+    if(self->content_dir == NULL)
+    {
+        printf("default content dir\n");
+        //default content dir
+        self->content_dir = malloc(sizeof(char)*9);
+        self->content_dir = "content/";
+    }
+    if(self->front_port == 0 || self->back_port == 0)
+    {
+        printf("Ports not specified!\n");
+    }
+    //printPeer(self);
+    self->num_files = 0;
+    peer_table[0] = self;
+    num_peers = peer_count;
+    return;
+
+}
 
 
 int main(int argc, char **argv) {
@@ -1101,18 +1351,39 @@ int main(int argc, char **argv) {
     struct sockaddr_in serveraddr; /* server's addr */
     struct sockaddr_in backaddr;
     int optval; /* flag value for setsockopt */
-    fd_set curr_set, live_set; /* Set of active fd's */ //????
+    fd_set curr_set, live_set; /* Set of active fd's */ 
+    char* conf = "node.conf";
     
     signal(SIGPIPE,SIG_IGN); //Sigpipe handling
     
     /* check command line args */
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <port> <backend_port>\n", argv[0]);
+    if (argc > 3) {
+        fprintf(stderr, "usage: %s -c <config_file>\n", argv[0]);
         exit(1);
     }
-    portno = atoi(argv[1]);
-    back_port = atoi(argv[2]);
+    if (argc == 3)
+    {
+        if (strcmp(argv[1], "-c") == 0)
+            conf = argv[2];
+        else
+        {
+            fprintf(stderr, "usage: %s -c <config_file>\n", argv[0]);
+            exit(1);
+        }
+
+    }
     
+    config(conf);
+
+
+    portno = peer_table[0]->front_port;
+    back_port = peer_table[0]->back_port;
+
+    for(int i = 0; i < 3; i++)
+    {
+        printPeer(peer_table[i]);
+    }
+
     srand(time(NULL)); //Initialize random number generator
 
     /* socket: create a socket */
@@ -1320,9 +1591,11 @@ void* serve(int connfd, fd_set* live_set)
     char *token = NULL;
     char key[200];
     char val[200];
+    char json[60];
+    char uuid_str[40];
     int range_low = -1;
     int range_high = -1;
-    char* content_type = NULL; 
+    char* content_type = ""; 
 
     struct sockaddr_in serveraddr;
     struct hostent *server;
@@ -1376,7 +1649,6 @@ void* serve(int connfd, fd_set* live_set)
         token = strtok(NULL, "\r\n");
     }
 
-
     ftype *f_ext = file_types;
     while(f_ext->ext){
         if(strcmp(f_ext->ext,sample->ext)==0)
@@ -1386,23 +1658,29 @@ void* serve(int connfd, fd_set* live_set)
         }
         f_ext++;
     }
+
     if (strcmp(content_type, "x-icon")==0)
     {
         return NULL;
     }
-    // printf("peer method: %d\n", sample->pm);
+    printf("peer method: %d\n", sample->pm);
+    bzero(buf, BUFSIZE);
     
     switch(sample->pm)
     {
         case 1:   //ADD
-            printf("HTTP Server has seen a peer ADD request\n");
             
+            printf("HTTP Server has seen a peer ADD request\n");
+
+            //OLD ADD METHOD -- Need to put struct sockaddr stuff into config
             /* socket: create the socket */
+
+            /*
             sockfd = socket(AF_INET, SOCK_DGRAM, 0);
             if (sockfd < 0)
                 error("ERROR opening socket");
-            
-            /* gethostbyname: get the server's DNS entry */
+            */
+            /* gethostbyname: get the server's DNS entry 
             server = gethostbyname((const char *)sample->host);
             
             if (server == NULL) {
@@ -1410,7 +1688,7 @@ void* serve(int connfd, fd_set* live_set)
                 exit(1);
             }
 
-            /* build the server's Internet address */
+            /* build the server's Internet address 
             bzero((char *) &serveraddr, sizeof(serveraddr));
             serveraddr.sin_family = AF_INET;
             bcopy((char *)server->h_addr,
@@ -1423,6 +1701,9 @@ void* serve(int connfd, fd_set* live_set)
             {
                 bps = sample->rate;
             }
+            */
+            printf("Adding file: %s to peer: %s\n", sample->path, (char*)sample->uuid);
+            addFile(sample->path, sample->uuid);
             break;
 
         case 0:   //VIEW
@@ -1433,6 +1714,38 @@ void* serve(int connfd, fd_set* live_set)
         case 2:   //CONFIG
             printf("HTTP Server has seen a peer CONFIG request\n");
             bps = sample->rate;
+            break;
+        case 5:  //KILL
+            printf("HTTP Server has seen a peer KILL request\n");
+            exit(0);
+            break;
+        case 6:  //UUID
+            printf("HTTP Server has seen a peer UUID request\n");
+            uuid_unparse(peer_table[0]->uuid, uuid_str);
+            sprintf(json, "{\"uuid\":\"%s\"}", uuid_str);
+            sprintf(buf, "HTTP/1.%c 200 OK\r\n"
+            "Content-Length: %d\r\n"
+            "Content-Type: application/json\r\n"
+            "Date: %s\r\n"
+            "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(json), get_rfc_time());
+            n = write(connfd, buf, strlen(buf));
+            n = write(connfd, json, strlen(json));
+            break;
+        case 7:  //ADDNEIGHBOR
+            printf("HTTP Server has seen a peer ADDNEIGHBOR request\n");
+            addNeighbor(sample->uuid, sample->host, sample->back_port, sample->front_port, sample->distance);
+            printPeer(peer_table[num_peers-1]);
+            break;
+        case 8:
+            printf("HTTP Server has seen a peer NEIGHBORS request\n");
+            token = tableToJSON();
+            sprintf(buf, "HTTP/1.%c 200 OK\r\n"
+            "Content-Length: %d\r\n"
+            "Content-Type: application/json\r\n"
+            "Date: %s\r\n"
+            "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(token), get_rfc_time());
+            n = write(connfd, buf, strlen(buf));
+            n = write(connfd, token, strlen(token));
             break;
 
         default:  //
