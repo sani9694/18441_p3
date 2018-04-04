@@ -22,6 +22,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <uuid/uuid.h>
+#include <mach/clock.h>
+#include <mach/mach.h>
 
 
 #define BUFSIZE 1024
@@ -161,6 +163,8 @@ typedef struct peer{
     char* files[20];       //Max number of files one peer can have is 20 **** MAYBE REVISIT AND MAKE IT DYNAMICALLY ALLOCATE
     char* host;
     struct sockaddr_in addr;
+    int last_sent;
+    int last_received;
 } peer, *peer_t;
 
 void printPeer(peer_t self)
@@ -228,8 +232,8 @@ static int flow_entries = 0;
 static int back_port;
 static int back_fd;
 static int window_g = 10; //change accordgingly
-static max_window_size;
-static rate;
+static unsigned int max_window_size;
+static int rate;
 
 
 packet* unwrap(char* buf);
@@ -245,8 +249,18 @@ void re_tx_last(packet* p, New_flow* prev_flow, int fd);
 void re_tx_last_sender(packet* p, New_flow* nf, int fd);
 
 int getTimeMilliseconds() {
-    struct timespec t;
-    uint64_t delta_ms = mach_absolute_time();
+    struct timespec ts;
+
+    clock_serv_t cclock;
+    mach_timespec_t mts;
+    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
+    clock_get_time(cclock, &mts);
+    mach_port_deallocate(mach_task_self(), cclock);
+    ts.tv_sec = mts.tv_sec;
+    ts.tv_nsec = mts.tv_nsec;
+
+
+    uint64_t delta_ms = (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
     return delta_ms;
 }
 
@@ -309,6 +323,8 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->content_dir = malloc(sizeof(char)*9);
     np->content_dir = "content/";
     np->num_files = 0;
+    np->last_sent = getTimeMilliseconds();
+    np->last_received = getTimeMilliseconds();
     peer_table[num_peers] = np;
     num_peers++;
 }
@@ -471,6 +487,29 @@ New_flow* flow_look(char flow_ID)
     return NULL;
 }
 
+int remove_peer(uuid_t uuid)
+{
+    int res = 0;
+    int i;
+    peer_t p;
+    for(i = 1; i < num_peers; i++)
+    {
+        p = peer_table[i];
+        if(uuid_compare(uuid, p->uuid) == 0) // Flow exists
+        {
+            res = 1;
+            num_peers--;
+            break;
+        }
+    }
+    while(i < num_peers)
+    {
+        peer_table[i] = peer_table[i+1];
+        i++;
+    }
+    return res;
+}
+
 int remove_flow(char flow_ID)
 {
     int res = 0;
@@ -600,7 +639,7 @@ packet* request_new_packet(char* path, char flowID, uint16_t source_port, uint16
     return p;
 }
 
-static v;
+static int v;
 packet* get_syn_ack(char flowID, uint16_t dest_port, uint16_t ack, char* data)
 {
 
@@ -622,12 +661,12 @@ packet* get_syn_ack(char flowID, uint16_t dest_port, uint16_t ack, char* data)
     return p;
 }
 
-static rtt_val;
+static int rtt_val;
 
 packet* get_ack(packet* p, New_flow* nf)
 {
 
-    static rtt;
+    static int rtt;
     // clock_t t = clock();
     p->rtt = p->rtt/CLOCKS_PER_SEC;
     packet* g = (packet*)malloc(sizeof(packet));
@@ -828,8 +867,7 @@ url_info parse(char *buf){
 }
 
 
-static
-void backend(int on_fd)
+static void backend(int on_fd)
 {
     char buf[MAXLINE];
     char data[MAXLINE];
@@ -1297,7 +1335,7 @@ void config(char* conf_file)
             peer_t np = malloc(sizeof(peer));
             char uuid_str[MAXLINE];
             char host[MAXLINE];
-            sscanf(val, "%[^,],%[^,],%u,%u,%d", uuid_str, host, &(np->front_port), &(np->back_port), &(np->distance));
+            sscanf(val, "%[^,],%[^,],%hu,%hu,%d", uuid_str, host, &(np->front_port), &(np->back_port), &(np->distance));
             if(uuid_parse(uuid_str, np->uuid) == -1)
             {
                 printf("Problem parsing peer's uuid string given\n");
@@ -1311,6 +1349,8 @@ void config(char* conf_file)
             np->content_dir = malloc(sizeof(char)*9);
             np->content_dir = "content/";
             np->num_files = 0;
+            np->last_sent = getTimeMilliseconds();
+            np->last_received = getTimeMilliseconds();
             //printPeer(np);
             peer_table[peer_count] = np;
             peer_count++;
@@ -1350,6 +1390,8 @@ void config(char* conf_file)
     }
     //printPeer(self);
     self->num_files = 0;
+    self->last_sent = getTimeMilliseconds();
+    self->last_received = getTimeMilliseconds();
     peer_table[0] = self;
     num_peers = peer_count;
     return;
@@ -1399,6 +1441,7 @@ int main(int argc, char **argv) {
         printPeer(peer_table[i]);
     }
 
+    remove_peer(peer_table[1]->uuid);
     srand(time(NULL)); //Initialize random number generator
 
     /* socket: create a socket */
@@ -1536,10 +1579,8 @@ int main(int argc, char **argv) {
                     break;
                 }
                 // printf("Trying flow %d\n", i);
-                char data[MAXLINE];
                 char buf[MAXLINE];
                 struct sockaddr_in sender;
-                long size;
                 socklen_t sender_len = sizeof(sender);
                 packet* p = malloc(sizeof(packet));
                 packet* g = malloc(sizeof(packet));
@@ -1739,7 +1780,7 @@ void* serve(int connfd, fd_set* live_set)
             uuid_unparse(peer_table[0]->uuid, uuid_str);
             sprintf(json, "{\"uuid\":\"%s\"}", uuid_str);
             sprintf(buf, "HTTP/1.%c 200 OK\r\n"
-            "Content-Length: %d\r\n"
+            "Content-Length: %lu\r\n"
             "Content-Type: application/json\r\n"
             "Date: %s\r\n"
             "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(json), get_rfc_time());
@@ -1755,7 +1796,7 @@ void* serve(int connfd, fd_set* live_set)
             printf("HTTP Server has seen a peer NEIGHBORS request\n");
             token = tableToJSON();
             sprintf(buf, "HTTP/1.%c 200 OK\r\n"
-            "Content-Length: %d\r\n"
+            "Content-Length: %lu\r\n"
             "Content-Type: application/json\r\n"
             "Date: %s\r\n"
             "Connection: Keep-Alive\r\n\r\n", sample->version, strlen(token), get_rfc_time());
