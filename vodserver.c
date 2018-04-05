@@ -234,7 +234,7 @@ static int back_fd;
 static int window_g = 10; //change accordgingly
 static unsigned int max_window_size;
 static int rate;
-
+uint64_t expiration = 30000;
 
 packet* unwrap(char* buf);
 char* package(packet* p);
@@ -285,13 +285,13 @@ void printFlowTable()
 
 void printPacket(packet* p)
 {
-    // printf("------------------------Printing Packet-------------------------------------------\n");
-    // printf("flags: %u | flowID: %d | source_port: %u\n", p->flags, (int)p->pack, p->source_port);
-    // printf("dest_port: %u | length: %u\n", p->dest_port, p->length);
-    // printf("syn: %u | ack: %u\n", p->syn, p->ack);
-    // printf("window: %u | rtt: %u\n", p->window, p->rtt);
-    // printf("data: %s\n", p->data);
-    // printf("-----------------------------End Packet-------------------------------------------\n");
+    printf("------------------------Printing Packet-------------------------------------------\n");
+    printf("flags: %u | flowID: %d | source_port: %u\n", p->flags, (int)p->pack, p->source_port);
+    printf("dest_port: %u | length: %u\n", p->dest_port, p->length);
+    printf("syn: %u | ack: %u\n", p->syn, p->ack);
+    printf("window: %u | rtt: %u\n", p->window, p->rtt);
+    printf("data: %s\n", p->data);
+    printf("-----------------------------End Packet-------------------------------------------\n");
 
 }
 
@@ -584,7 +584,7 @@ void getContent(char* path, int fd)
     req = request_new_packet(path, getFlowID(), back_port, port);
     buf = package(req);
     // printf("Sending Request Packet: \n");
-    printPacket(req);
+  //  printPacket(req);
 
     //Add to Flow Table
     flow_add(req->pack, *provider, req->syn, 0, path, NULL, 0, fd, req->window);
@@ -908,7 +908,7 @@ static void backend(int on_fd)
 
     bzero(buf, MAXLINE);
     // printf("Received Packed of length %lu: \n", (strlen(buf+16)+16));
-    printPacket(p);
+ //   printPacket(p);
     if(p->flags == 0x04)
     {
         // printf("Came here\n");
@@ -959,7 +959,7 @@ static void backend(int on_fd)
         //send syn ack
         memcpy(buf, package(g), send_len(g));
         // printf("Sending Packet of length %lu:\n", (16 + strlen(buf+16)));
-        printPacket(g);
+    //    printPacket(g);
         if(sendto(on_fd, buf, send_len(g), 0, (struct sockaddr*)&sender, sender_len) < 0)
         {
             printf("Error while trying to send a SYN ACK");
@@ -1014,7 +1014,7 @@ static void backend(int on_fd)
         nf->file_size = atoi(p->data);
 
         // printf("Sending Packet:\n");
-        printPacket(g);
+      //  printPacket(g);
 
 
         if(sendto(on_fd, buf, send_len(g), 0, (struct sockaddr*)&sender, sizeof(sender)) < 0)
@@ -1123,7 +1123,7 @@ static void backend(int on_fd)
                 //send ack
                 memcpy(buf, package(g), send_len(g));
                 // printf("Sending Packet:\n");
-                printPacket(g);
+         //       printPacket(g);
                 // printf("Sending a packet of length %d\n", send_len(g));
 
                 if(sendto(on_fd, buf, send_len(g), 0, (struct sockaddr*)&sender, sizeof(sender)) < 0)
@@ -1168,7 +1168,7 @@ static void backend(int on_fd)
             memcpy(buf, package(g), send_len(g));
 
             // printf("Sending Packet:\n");
-            printPacket(g);
+         //   printPacket(g);
 
 
             if (p->syn == nf->last_ack + 1) {
@@ -1189,7 +1189,6 @@ static void backend(int on_fd)
             }
             
         }
-
     }
     else if(p->flags == 0x0a)
     {
@@ -1232,7 +1231,7 @@ static void backend(int on_fd)
             memcpy(buf, package(g), send_len(g));
 
             // printf("Sending Packet:\n");
-            printPacket(g);
+         //   printPacket(g);
 
             if(sendto(on_fd, buf, send_len(g), 0, (struct sockaddr*)&sender, sizeof(sender)) < 0)
             {
@@ -1242,6 +1241,20 @@ static void backend(int on_fd)
         }
         // printf("Removing Flow \n\n**********************************************\n");
         remove_flow(nf->pack);
+    }
+    else if(p->flags == 0x01)
+    {
+        printf("Somebody's out there!\n");
+        uuid_t uuid;
+        uuid_parse(p->data, uuid);
+        for(int i = 0; i < num_peers; i++)
+        {
+            if(uuid_compare(peer_table[i]->uuid, uuid) == 0)
+            {
+                printf("Getting this lil guy a new time!\n");
+                peer_table[i]->last_received = getTimeMilliseconds();
+            }
+        }
     }
     free(p);
     free(g);
@@ -1280,7 +1293,7 @@ void re_tx_last_sender(packet* p, New_flow* nf, int on_fd){
     //send ack
     memcpy(buf, package(g), send_len(g));
     // printf("Sending Packet:\n");
-    printPacket(g);
+   // printPacket(g);
     // printf("Sending a packet of length %d\n", send_len(g));
 
     if(sendto(on_fd, buf, send_len(g), 0, (struct sockaddr*)&nf->addr, sizeof(sender)) < 0)
@@ -1410,6 +1423,43 @@ void config(char* conf_file)
 
 }
 
+packet* keepAlivePacket(peer_t peer)
+{
+    packet* p = (packet*)malloc(sizeof(packet));
+    char uuid[40];
+    uuid_unparse(peer->uuid, uuid);
+    p->flags = 0x01;  //0x0001  PEER FLAG
+    p->pack = 0;
+    p->source_port = peer_table[0]->back_port;
+    p->dest_port = peer->back_port;
+    p->length = strlen(uuid);
+    p->syn = 0;
+    p->ack = 67;    //NOT IMPORTANT
+    p->data = uuid;
+    p->window = window_g;
+    return p;
+}
+
+void sendKeepAlive()
+{
+    char* buf;
+    struct sockaddr_in* provider = NULL;
+    unsigned short port;
+    packet* p;
+
+    for(int i = 1; i < num_peers; i++)
+    {
+        printf("Let's go!\n");
+        p = keepAlivePacket(peer_table[i]);
+        printPacket(p);
+        buf = package(p);
+        provider = &(peer_table[i]->addr);
+        port = peer_table[i]->back_port;
+        if(sendto(back_fd, buf, send_len(p), 0, (struct sockaddr*)provider, sizeof(*provider)) < 0)
+            printf("Error sending first request packet");
+    }
+}
+
 
 int main(int argc, char **argv) {
     int listenfd; /* listening socket for http */
@@ -1455,7 +1505,7 @@ int main(int argc, char **argv) {
     if (listenfd < 0)
         error("ERROR opening socket");
     if (back_fd < 0)
-        error("ERROR opening backend socket");
+        error("ERROR opening socket");
     
     /* setsockopt: Handy debugging trick that lets
      * us rerun the server immediately after we kill it;
@@ -1625,7 +1675,7 @@ int main(int argc, char **argv) {
                         //send ack
                         memcpy(buf, package(g), send_len(g));
                         // printf("Sending Packet:\n");
-                        printPacket(g);
+         //               printPacket(g);
                         // printf("Sending a packet of length %d\n", send_len(g));
 
                         if(sendto(nf->on_fd, buf, send_len(g), 0, (struct sockaddr*)&nf->addr, sizeof(sender)) < 0)
@@ -1638,6 +1688,21 @@ int main(int argc, char **argv) {
                 }
                 free(p);
                 free(g);
+            }
+            if (getTimeMilliseconds() - last_timeout_check > 10000) {
+                //Handle PEERing
+                uint64_t curr_time = getTimeMilliseconds();
+                sendKeepAlive();
+                for(int i = 1; i < num_peers; i++)
+                {
+                    if((curr_time - peer_table[i]->last_received) > expiration)
+                    {
+                        printf("CHUUCH my homie dead\n");
+                        remove_peer(peer_table[i]->uuid);
+                        i--;
+                    }
+                }
+
             }
             last_timeout_check = getTimeMilliseconds();
         }
