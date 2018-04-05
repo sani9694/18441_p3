@@ -163,8 +163,7 @@ typedef struct peer{
     char* files[20];       //Max number of files one peer can have is 20 **** MAYBE REVISIT AND MAKE IT DYNAMICALLY ALLOCATE
     char* host;
     struct sockaddr_in addr;
-    int last_sent;
-    int last_received;
+    uint64_t last_received;
 } peer, *peer_t;
 
 void printPeer(peer_t self)
@@ -324,7 +323,6 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->content_dir = malloc(sizeof(char)*9);
     np->content_dir = "content/";
     np->num_files = 0;
-    np->last_sent = getTimeMilliseconds();
     np->last_received = getTimeMilliseconds();
     peer_table[num_peers] = np;
     np->addr = get_sockaddr_from_host(np->host, np->back_port);
@@ -1247,12 +1245,13 @@ static void backend(int on_fd)
         printf("Somebody's out there!\n");
         uuid_t uuid;
         uuid_parse(p->data, uuid);
-        for(int i = 0; i < num_peers; i++)
+        for(int i = 1; i < num_peers; i++)
         {
             if(uuid_compare(peer_table[i]->uuid, uuid) == 0)
             {
                 printf("Getting this lil guy a new time!\n");
                 peer_table[i]->last_received = getTimeMilliseconds();
+                printf("Did you get it: %llu\n", peer_table[i]->last_received);
             }
         }
     }
@@ -1373,7 +1372,6 @@ void config(char* conf_file)
             np->content_dir = malloc(sizeof(char)*9);
             np->content_dir = "content/";
             np->num_files = 0;
-            np->last_sent = getTimeMilliseconds();
             np->last_received = getTimeMilliseconds();
             np->addr = get_sockaddr_from_host(np->host, np->back_port);
             //printPeer(np);
@@ -1415,7 +1413,6 @@ void config(char* conf_file)
     }
     //printPeer(self);
     self->num_files = 0;
-    self->last_sent = getTimeMilliseconds();
     self->last_received = getTimeMilliseconds();
     peer_table[0] = self;
     num_peers = peer_count;
@@ -1427,7 +1424,7 @@ packet* keepAlivePacket(peer_t peer)
 {
     packet* p = (packet*)malloc(sizeof(packet));
     char uuid[40];
-    uuid_unparse(peer->uuid, uuid);
+    uuid_unparse(peer_table[0]->uuid, uuid);
     p->flags = 0x01;  //0x0001  PEER FLAG
     p->pack = 0;
     p->source_port = peer_table[0]->back_port;
@@ -1451,7 +1448,7 @@ void sendKeepAlive()
     {
         printf("Let's go!\n");
         p = keepAlivePacket(peer_table[i]);
-        printPacket(p);
+        //printPacket(p);
         buf = package(p);
         provider = &(peer_table[i]->addr);
         port = peer_table[i]->back_port;
@@ -1553,9 +1550,29 @@ int main(int argc, char **argv) {
     /* main loop */
     // int akskd = 0;
     uint64_t last_timeout_check = getTimeMilliseconds();
+    uint64_t last_peering_check = getTimeMilliseconds();
+    uint64_t curr_time = getTimeMilliseconds();
     while (1) {
-        // printf("%d\n", akskd++);
-        //printf("hiiii!~ER@#$T~~~~~~~~~~~~\n");
+        curr_time = getTimeMilliseconds();
+        //printf("looping %lu\n", curr_time);
+        if ((curr_time - last_peering_check) > 10000) 
+        {
+                //Handle PEERing
+            printf("PEERING\n");
+            sendKeepAlive();
+            for(int i = 1; i < num_peers; i++)
+            {
+                if((curr_time - peer_table[i]->last_received) > expiration)
+                {
+
+                    printf("CHUUCH my homie dead: it is %llu and I last heard from him %llu\n", curr_time, peer_table[i]->last_received);
+                    remove_peer(peer_table[i]->uuid);
+                    i--;
+                }
+            }
+            last_peering_check = curr_time;
+
+        }
         curr_set = live_set;
         // curr_set always overwritten from the beginning???\
         // where do we set FD_SETSIZE?
@@ -1688,21 +1705,6 @@ int main(int argc, char **argv) {
                 }
                 free(p);
                 free(g);
-            }
-            if (getTimeMilliseconds() - last_timeout_check > 10000) {
-                //Handle PEERing
-                uint64_t curr_time = getTimeMilliseconds();
-                sendKeepAlive();
-                for(int i = 1; i < num_peers; i++)
-                {
-                    if((curr_time - peer_table[i]->last_received) > expiration)
-                    {
-                        printf("CHUUCH my homie dead\n");
-                        remove_peer(peer_table[i]->uuid);
-                        i--;
-                    }
-                }
-
             }
             last_timeout_check = getTimeMilliseconds();
         }
