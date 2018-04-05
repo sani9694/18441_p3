@@ -247,6 +247,7 @@ void *serve(int connfd, fd_set* live_set);
 char* get_rfc_time();
 void re_tx_last(packet* p, New_flow* prev_flow, int fd);
 void re_tx_last_sender(packet* p, New_flow* nf, int fd);
+struct sockaddr_in get_sockaddr_from_host(char* host, uint16_t back_port);
 
 int getTimeMilliseconds() {
     struct timespec ts;
@@ -326,6 +327,7 @@ void addNeighbor(uuid_t uuid, char* host, uint16_t frontend, uint16_t backend, i
     np->last_sent = getTimeMilliseconds();
     np->last_received = getTimeMilliseconds();
     peer_table[num_peers] = np;
+    np->addr = get_sockaddr_from_host(np->host, np->back_port);
     num_peers++;
 }
 
@@ -339,7 +341,8 @@ char* peerToJSON(peer_t p)
                   "\"host\":\"%s\","
                   "\"frontend\":\"%u\","
                   "\"backend\":\"%u\","
-                  "\"metric\":\"%d\"}", uuid, p->name, p->host, p->front_port, p->back_port, p->distance);
+                  "\"num_files\":\"%d\","
+                  "\"metric\":\"%d\"}", uuid, p->name, p->host, p->front_port, p->back_port, p->num_files, p->distance);
     return json;
 
 }
@@ -395,7 +398,7 @@ void addFile(char* file, uuid_t uuid)
             printf("Adding file: %s to peer: %s\n", file, p->name);
             p->files[p->num_files] = malloc(sizeof(char)*strlen(file));
             sprintf(p->files[p->num_files], "%s", file);
-            p->num_files++;
+            peer_table[i]->num_files += 1;
             return;
         }
     }
@@ -407,13 +410,17 @@ void addFile(char* file, uuid_t uuid)
 int fileLook(char* file)
 {
     peer_t p;
-    for(int i = 0; i < num_peers; i++)
+    printf("num_peers = %d\n", num_peers);
+    for(int i = 1; i < num_peers; i++)
     {
+        printf("checking peer #%d which has %d files\n", i, p->num_files);
         p = peer_table[i];
         for(int j = 0; j < p->num_files; j++)
         {
+            printf("Checking \"%s\"\n", p->files[j]);
             if(strcmp(file, p->files[j]) == 0)
             {
+                printf("FOUND\n");
                 return i;
             }
         }
@@ -562,6 +569,7 @@ void getContent(char* path, int fd)
 
     //Look for who has the file in the lookup table
     index = fileLook(path);
+
 
     if(index == -1)
     {
@@ -869,6 +877,7 @@ url_info parse(char *buf){
 
 static void backend(int on_fd)
 {
+    char* path;
     char buf[MAXLINE];
     char data[MAXLINE];
     struct sockaddr_in sender;
@@ -916,7 +925,8 @@ static void backend(int on_fd)
         }
 
         //get file length
-        FILE* file = fopen(p->data,"r");
+        path = strcat(peer_table[0]->content_dir, p->data);
+        FILE* file = fopen(path, "r");
         if(file == NULL)
         {
             printf("Could not find the desired file\n\n");
@@ -1294,6 +1304,7 @@ void config(char* conf_file)
 
     //set defaults
     self->content_dir = NULL;
+    self->distance = 0;
     bzero(self->uuid, 16);
 
     file = fopen(conf_file, "r");
@@ -1351,6 +1362,7 @@ void config(char* conf_file)
             np->num_files = 0;
             np->last_sent = getTimeMilliseconds();
             np->last_received = getTimeMilliseconds();
+            np->addr = get_sockaddr_from_host(np->host, np->back_port);
             //printPeer(np);
             peer_table[peer_count] = np;
             peer_count++;
@@ -1432,14 +1444,8 @@ int main(int argc, char **argv) {
     
     config(conf);
 
-
     portno = peer_table[0]->front_port;
     back_port = peer_table[0]->back_port;
-
-    for(int i = 0; i < 3; i++)
-    {
-        printPeer(peer_table[i]);
-    }
 
     srand(time(NULL)); //Initialize random number generator
 
@@ -1489,7 +1495,6 @@ int main(int argc, char **argv) {
         error("ERROR on listen");
 
     fcntl(listenfd, F_SETFL, O_NONBLOCK);
-    
     FD_ZERO(&curr_set);
     FD_ZERO(&live_set);
     FD_SET(listenfd, &live_set);
@@ -1639,6 +1644,34 @@ int main(int argc, char **argv) {
     }
 }
 
+struct sockaddr_in get_sockaddr_from_host(char* host, uint16_t back_port)
+{
+    struct sockaddr_in serveraddr;
+    struct hostent *server;
+    int sockfd;
+
+    /* socket: create the socket */
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0)
+        error("ERROR opening socket");
+    /* gethostbyname: get the server's DNS entry */
+    server = gethostbyname((const char *)host); 
+    
+    if (server == NULL) {
+        fprintf(stderr,"ERROR, no such host as %s\n", host);
+        exit(1);
+    }
+
+    /* build the server's Internet address */
+    bzero((char *) &serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    bcopy((char *)server->h_addr,
+          (char *)&serveraddr.sin_addr.s_addr, server->h_length);
+    serveraddr.sin_port = htons(back_port);
+    return serveraddr;
+}
+
 void* serve(int connfd, fd_set* live_set)
 {
     char buf[BUFSIZE]; /* message buffer */
@@ -1651,11 +1684,6 @@ void* serve(int connfd, fd_set* live_set)
     int range_low = -1;
     int range_high = -1;
     char* content_type = ""; 
-
-    struct sockaddr_in serveraddr;
-    struct hostent *server;
-    int sockfd;
-
     
     /* read: read input string from the client */
     bzero(buf, BUFSIZE);
@@ -1727,42 +1755,13 @@ void* serve(int connfd, fd_set* live_set)
             
             printf("HTTP Server has seen a peer ADD request\n");
 
-            //OLD ADD METHOD -- Need to put struct sockaddr stuff into config
-            /* socket: create the socket */
-
-            /*
-            sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-            if (sockfd < 0)
-                error("ERROR opening socket");
-            */
-            /* gethostbyname: get the server's DNS entry 
-            server = gethostbyname((const char *)sample->host);
-            
-            if (server == NULL) {
-                fprintf(stderr,"ERROR, no such host as %s\n", sample->host);
-                exit(1);
-            }
-
-            /* build the server's Internet address 
-            bzero((char *) &serveraddr, sizeof(serveraddr));
-            serveraddr.sin_family = AF_INET;
-            bcopy((char *)server->h_addr,
-                  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
-            serveraddr.sin_port = htons(sample->back_port);
-            
-            
-            addPeer(sample->path, serveraddr, (unsigned short int)sample->back_port);
-            if(sample->rate != 0)
-            {
-                bps = sample->rate;
-            }
-            */
-            printf("Adding file: %s to peer: %s\n", sample->path, (char*)sample->uuid);
+            printf("Adding file: \"%s\" to peer: %s\n", sample->path, (char*)sample->uuid);
             addFile(sample->path, sample->uuid);
             break;
 
         case 0:   //VIEW
             printf("HTTP Server has seen a peer VIEW request\n");
+            printf("Looking for \"%s\"\n", sample->path);
             getContent(sample->path, connfd);
             break;
 
